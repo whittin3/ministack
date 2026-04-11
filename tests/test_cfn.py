@@ -1172,6 +1172,27 @@ def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     assert elbv2.describe_load_balancers(Names=[lb_name])["LoadBalancers"] == []
 
 
+def test_cfn_cloudwatch_alarm_lifecycle(cfn, cw):
+    """CloudFormation creates a metric alarm and removes it on stack delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cwal-{uid}"
+    alarm_name = f"cfn-cw-alarm-{uid}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "CpuAlarm": {
+                "Type": "AWS::CloudWatch::Alarm",
+                "Properties": {
+                    "AlarmName": alarm_name,
+                    "AlarmDescription": "CFN integration test",
+                    "MetricName": "CPUUtilization",
+                    "Namespace": f"CfnCwTest/{uid}",
+                    "Statistic": "Average",
+                    "Period": 60,
+                    "EvaluationPeriods": 1,
+                    "Threshold": 80.0,
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "TreatMissingData": "notBreaching",
 def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     """CloudFormation provisions Route53 HostedZone + RecordSet and removes records on delete."""
     uid = _uuid_mod.uuid4().hex[:8]
@@ -1197,6 +1218,8 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
             },
         },
         "Outputs": {
+            "AlarmNameOut": {"Value": {"Ref": "CpuAlarm"}},
+            "AlarmArnOut": {"Value": {"Fn::GetAtt": ["CpuAlarm", "Arn"]}},
             "RecordFqdn": {"Value": {"Ref": "WebA"}},
         },
     }
@@ -1205,6 +1228,20 @@ def test_cfn_route53_hosted_zone_and_record_set(cfn, r53):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["AlarmNameOut"] == alarm_name
+    assert outputs["AlarmArnOut"].endswith(f":alarm:{alarm_name}")
+
+    resp = cw.describe_alarms(AlarmNames=[alarm_name])
+    assert len(resp["MetricAlarms"]) == 1
+    a = resp["MetricAlarms"][0]
+    assert a["MetricName"] == "CPUUtilization"
+    assert a["Namespace"] == f"CfnCwTest/{uid}"
+    assert float(a["Threshold"]) == 80.0
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    resp2 = cw.describe_alarms(AlarmNames=[alarm_name])
+    assert resp2["MetricAlarms"] == []
     assert outputs["RecordFqdn"].endswith(".")
 
     resources = {r["LogicalResourceId"]: r for r in cfn.describe_stack_resources(StackName=stack_name)["StackResources"]}
