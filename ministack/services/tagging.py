@@ -1,14 +1,40 @@
 """
 Resource Groups Tagging API emulator.
-Phase 2: extends GetResources to 15 services and adds GetTagKeys, GetTagValues.
+
+Supports the five operations of the real ResourceGroupsTaggingAPI_20170126
+target (`GetResources`, `GetTagKeys`, `GetTagValues`, `TagResources`,
+`UntagResources`) across the services listed in ``_COLLECTORS`` / ``_WRITERS``.
+
+Architecture:
+- **Collectors** (one per service) yield ``(arn, [{"Key":..., "Value":...}])``
+  tuples by reading each service module's tag state. Used by GetResources.
+- **Writers** apply a ``{key: value}`` dict onto a service's tag state for a
+  given ARN. Used by TagResources. Writers raise ``_ResourceNotFound`` when
+  the ARN points at a resource that does not exist in the caller's account;
+  the entry point catches it and surfaces the ARN in ``FailedResourcesMap``
+  with ``InvalidParameterException``, matching AWS.
+- **Removers** do the inverse for UntagResources.
+
+Each service keeps its own tag format (S3 flat dict, DynamoDB key/value list,
+KMS TagKey/TagValue, ECS lowercase key/value, …); the helpers in this file
+normalise to the standard ``[{"Key":..., "Value":...}]`` shape on read and
+denormalise on write.
 """
 
 import json
 import logging
 import os
+from ministack.core.responses import get_region
 
 logger = logging.getLogger("tagging")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+class _ResourceNotFound(Exception):
+    """Raised by a writer/remover when the target ARN refers to a resource
+    that does not exist in the caller's account. Caught by the TagResources /
+    UntagResources entry points and surfaced in ``FailedResourcesMap`` with
+    ``InvalidParameterException`` (matches real AWS behaviour)."""
 
 
 # ── Tag format normalisation ──────────────────────────────────────────────────
@@ -44,7 +70,7 @@ def _collect_s3():
 def _collect_lambda():
     import ministack.services.lambda_svc as svc
     for name, fn in svc._functions.items():
-        arn = f"arn:aws:lambda:{REGION}:{_account()}:function:{name}"
+        arn = f"arn:aws:lambda:{get_region()}:{_account()}:function:{name}"
         yield arn, _normalise_flat(fn.get("tags", {}))
 
 
@@ -89,14 +115,14 @@ def _collect_eventbridge():
 def _collect_kms():
     import ministack.services.kms as svc
     for key_id, rec in svc._keys.items():
-        arn = f"arn:aws:kms:{REGION}:{_account()}:key/{key_id}"
+        arn = f"arn:aws:kms:{get_region()}:{_account()}:key/{key_id}"
         yield arn, _normalise_kms(rec.get("Tags", []))
 
 
 def _collect_ecr():
     import ministack.services.ecr as svc
     for name, repo in svc._repositories.items():
-        arn = f"arn:aws:ecr:{REGION}:{_account()}:repository/{name}"
+        arn = f"arn:aws:ecr:{get_region()}:{_account()}:repository/{name}"
         yield arn, _normalise_list(repo.get("tags", []))
 
 
@@ -115,10 +141,10 @@ def _collect_glue():
 def _collect_cognito():
     import ministack.services.cognito as svc
     for pool_id, pool in svc._user_pools.items():
-        arn = f"arn:aws:cognito-idp:{REGION}:{_account()}:userpool/{pool_id}"
+        arn = f"arn:aws:cognito-idp:{get_region()}:{_account()}:userpool/{pool_id}"
         yield arn, _normalise_flat(pool.get("UserPoolTags", {}))
     for pool_id, tags in svc._identity_tags.items():
-        arn = f"arn:aws:cognito-identity:{REGION}:{_account()}:identitypool/{pool_id}"
+        arn = f"arn:aws:cognito-identity:{get_region()}:{_account()}:identitypool/{pool_id}"
         yield arn, _normalise_flat(tags)
 
 
@@ -143,10 +169,10 @@ def _collect_cloudfront():
 def _collect_efs():
     import ministack.services.efs as svc
     for fs_id, fs in svc._file_systems.items():
-        arn = f"arn:aws:elasticfilesystem:{REGION}:{_account()}:file-system/{fs_id}"
+        arn = f"arn:aws:elasticfilesystem:{get_region()}:{_account()}:file-system/{fs_id}"
         yield arn, _normalise_list(fs.get("Tags", []))
     for ap_id, ap in svc._access_points.items():
-        arn = f"arn:aws:elasticfilesystem:{REGION}:{_account()}:access-point/{ap_id}"
+        arn = f"arn:aws:elasticfilesystem:{get_region()}:{_account()}:access-point/{ap_id}"
         yield arn, _normalise_list(ap.get("Tags", []))
 
 
@@ -220,24 +246,38 @@ def _write_s3(arn, tags):
 
 
 def _write_lambda(arn, tags):
+    """Merge ``tags`` into the Lambda function's ``tags`` field.
+
+    Raises ``_ResourceNotFound`` if the function does not exist in the caller's
+    account (AWS returns InvalidParameterException in that case)."""
     import ministack.services.lambda_svc as svc
     name = arn.split("function:")[-1]
-    if name in svc._functions:
-        svc._functions[name].setdefault("tags", {}).update(tags)
+    if name not in svc._functions:
+        raise _ResourceNotFound(arn)
+    svc._functions[name].setdefault("tags", {}).update(tags)
 
 
 def _write_sqs(arn, tags):
+    """Merge ``tags`` into the SQS queue keyed by ``QueueArn``.
+
+    Raises ``_ResourceNotFound`` if no queue in the caller's account matches."""
     import ministack.services.sqs as svc
     for q in svc._queues.values():
         if q.get("attributes", {}).get("QueueArn") == arn:
             q.setdefault("tags", {}).update(tags)
-            break
+            return
+    raise _ResourceNotFound(arn)
 
 
 def _write_sns(arn, tags):
+    """Merge ``tags`` into the SNS topic at ``arn``.
+
+    Raises ``_ResourceNotFound`` if the topic does not exist in the caller's
+    account."""
     import ministack.services.sns as svc
-    if arn in svc._topics:
-        svc._topics[arn].setdefault("tags", {}).update(tags)
+    if arn not in svc._topics:
+        raise _ResourceNotFound(arn)
+    svc._topics[arn].setdefault("tags", {}).update(tags)
 
 
 def _write_dynamodb(arn, tags):
@@ -283,10 +323,15 @@ def _write_glue(arn, tags):
 
 
 def _write_cognito_idp(arn, tags):
+    """Merge ``tags`` into the Cognito user pool's ``UserPoolTags`` field.
+
+    Raises ``_ResourceNotFound`` if the pool does not exist in the caller's
+    account."""
     import ministack.services.cognito as svc
     pool_id = arn.split("userpool/")[-1]
-    if pool_id in svc._user_pools:
-        svc._user_pools[pool_id].setdefault("UserPoolTags", {}).update(tags)
+    if pool_id not in svc._user_pools:
+        raise _ResourceNotFound(arn)
+    svc._user_pools[pool_id].setdefault("UserPoolTags", {}).update(tags)
 
 
 def _write_cognito_identity(arn, tags):
@@ -345,30 +390,38 @@ def _remove_s3(arn, keys):
 
 
 def _remove_lambda(arn, keys):
+    """Remove ``keys`` from the Lambda function's ``tags`` field.
+
+    Raises ``_ResourceNotFound`` if the function does not exist."""
     import ministack.services.lambda_svc as svc
     name = arn.split("function:")[-1]
-    if name in svc._functions:
-        tags = svc._functions[name].get("tags", {})
-        for k in keys:
-            tags.pop(k, None)
+    if name not in svc._functions:
+        raise _ResourceNotFound(arn)
+    tags = svc._functions[name].get("tags", {})
+    for k in keys:
+        tags.pop(k, None)
 
 
 def _remove_sqs(arn, keys):
+    """Remove ``keys`` from the SQS queue's tags. Raises ``_ResourceNotFound``."""
     import ministack.services.sqs as svc
     for q in svc._queues.values():
         if q.get("attributes", {}).get("QueueArn") == arn:
             tags = q.get("tags", {})
             for k in keys:
                 tags.pop(k, None)
-            break
+            return
+    raise _ResourceNotFound(arn)
 
 
 def _remove_sns(arn, keys):
+    """Remove ``keys`` from the SNS topic's tags. Raises ``_ResourceNotFound``."""
     import ministack.services.sns as svc
-    if arn in svc._topics:
-        tags = svc._topics[arn].get("tags", {})
-        for k in keys:
-            tags.pop(k, None)
+    if arn not in svc._topics:
+        raise _ResourceNotFound(arn)
+    tags = svc._topics[arn].get("tags", {})
+    for k in keys:
+        tags.pop(k, None)
 
 
 def _remove_dynamodb(arn, keys):
@@ -414,12 +467,14 @@ def _remove_glue(arn, keys):
 
 
 def _remove_cognito_idp(arn, keys):
+    """Remove ``keys`` from a Cognito user pool's tags. Raises ``_ResourceNotFound``."""
     import ministack.services.cognito as svc
     pool_id = arn.split("userpool/")[-1]
-    if pool_id in svc._user_pools:
-        tags = svc._user_pools[pool_id].get("UserPoolTags", {})
-        for k in keys:
-            tags.pop(k, None)
+    if pool_id not in svc._user_pools:
+        raise _ResourceNotFound(arn)
+    tags = svc._user_pools[pool_id].get("UserPoolTags", {})
+    for k in keys:
+        tags.pop(k, None)
 
 
 def _remove_cognito_identity(arn, keys):
@@ -538,6 +593,13 @@ def _get_tag_values(data):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _tag_resources(data):
+    """TagResources: apply ``Tags`` to every ARN in ``ResourceARNList``.
+
+    Per ARN, failures are reported in ``FailedResourcesMap``:
+      - Unknown service segment → ``InvalidParameterException`` (400).
+      - Resource not found in caller's account → ``InvalidParameterException`` (400).
+      - Anything else raised by the writer → ``InternalServiceException`` (500).
+    The top-level response is always 200 with a (possibly empty) map, matching AWS."""
     arn_list = data.get("ResourceARNList", [])
     tags = data.get("Tags", {})
     failed = {}
@@ -547,13 +609,19 @@ def _tag_resources(data):
         writer = _WRITERS.get(svc_key)
         if writer is None:
             failed[arn] = {
-                "ErrorCode": "InternalServiceException",
+                "ErrorCode": "InvalidParameterException",
                 "ErrorMessage": f"Unsupported resource type: {svc_key}",
-                "StatusCode": 501,
+                "StatusCode": 400,
             }
             continue
         try:
             writer(arn, tags)
+        except _ResourceNotFound:
+            failed[arn] = {
+                "ErrorCode": "InvalidParameterException",
+                "ErrorMessage": f"Resource not found: {arn}",
+                "StatusCode": 400,
+            }
         except Exception as exc:
             failed[arn] = {
                 "ErrorCode": "InternalServiceException",
@@ -567,6 +635,10 @@ def _tag_resources(data):
 
 
 def _untag_resources(data):
+    """UntagResources: remove ``TagKeys`` from every ARN in ``ResourceARNList``.
+
+    Per-ARN failure semantics match :func:`_tag_resources`. Missing tag keys on
+    an existing resource are a no-op, not a failure."""
     arn_list = data.get("ResourceARNList", [])
     tag_keys = data.get("TagKeys", [])
     failed = {}
@@ -576,13 +648,19 @@ def _untag_resources(data):
         remover = _REMOVERS.get(svc_key)
         if remover is None:
             failed[arn] = {
-                "ErrorCode": "InternalServiceException",
+                "ErrorCode": "InvalidParameterException",
                 "ErrorMessage": f"Unsupported resource type: {svc_key}",
-                "StatusCode": 501,
+                "StatusCode": 400,
             }
             continue
         try:
             remover(arn, tag_keys)
+        except _ResourceNotFound:
+            failed[arn] = {
+                "ErrorCode": "InvalidParameterException",
+                "ErrorMessage": f"Resource not found: {arn}",
+                "StatusCode": 400,
+            }
         except Exception as exc:
             failed[arn] = {
                 "ErrorCode": "InternalServiceException",
